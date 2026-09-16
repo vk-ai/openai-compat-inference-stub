@@ -76,7 +76,7 @@ def test_deterministic_same_input(client: TestClient):
 def test_different_input_different_digest(client: TestClient):
     a = client.post(
         "/v1/chat/completions",
-        json={"messages": [{"role": "user", "content": "alpha"}],
+        json={"messages": [{"role": "user", "content": "alpha"}]},
     ).json()
     b = client.post(
         "/v1/chat/completions",
