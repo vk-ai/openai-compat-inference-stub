@@ -10,10 +10,11 @@ Minimal **OpenAI-compatible** chat completions serving stub built with **FastAPI
 
 - `POST /v1/chat/completions` — OpenAI-ish request/response shape
 - **Mock model** — deterministic reply derived from `messages` (no GPU, no network)
-- **Latency metrics** — `X-Latency-Ms` response header, `latency_ms` on the JSON body, and `GET /metrics`
+- **Latency + TTFT metrics** — `X-Latency-Ms` / `X-TTFT-Ms` headers, `latency_ms` on the JSON body, and `GET /metrics` (`avg_ttft_ms`, `last_ttft_ms`, `stream_request_count`)
+- **Streaming** — `stream=true` returns OpenAI-compatible SSE (`data: {chunk}\n\n` … `data: [DONE]`)
 - `GET /health` — liveness
 
-Streaming (`stream=true`) is intentionally **not** supported.
+> **Honesty:** This is an OSS/learning stub only. It is not a production inference gateway and does not claim employer (or any vendor) production parity.
 
 ## Quick start
 
@@ -36,7 +37,17 @@ curl -s -X POST http://127.0.0.1:8000/v1/chat/completions \
     ]
   }' | python -m json.tool
 
-# Health + metrics
+# Streaming (SSE)
+curl -N -s -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -D - \
+  -d '{
+    "model": "stub-model",
+    "stream": true,
+    "messages": [{"role": "user", "content": "Hello stream"}]
+  }'
+
+# Health + metrics (includes TTFT aggregates after stream)
 curl -s http://127.0.0.1:8000/health | python -m json.tool
 curl -s http://127.0.0.1:8000/metrics | python -m json.tool
 ```

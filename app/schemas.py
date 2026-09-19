@@ -57,3 +57,22 @@ class ChatCompletionResponse(BaseModel):
     usage: Usage
     # Custom observability field (also mirrored in X-Latency-Ms header)
     latency_ms: float
+
+
+class ChatCompletionChunkDelta(BaseModel):
+    role: Literal["assistant"] | None = None
+    content: str | None = None
+
+
+class ChatCompletionChunkChoice(BaseModel):
+    index: int = 0
+    delta: ChatCompletionChunkDelta
+    finish_reason: Literal["stop", "length"] | None = None
+
+
+class ChatCompletionChunk(BaseModel):
+    id: str
+    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: list[ChatCompletionChunkChoice]

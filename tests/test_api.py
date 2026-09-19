@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -19,8 +20,12 @@ from app.metrics import metrics  # noqa: E402
 def _reset_metrics():
     metrics.request_count = 0
     metrics.error_count = 0
+    metrics.stream_request_count = 0
     metrics.total_latency_ms = 0.0
     metrics.last_latency_ms = 0.0
+    metrics.total_ttft_ms = 0.0
+    metrics.last_ttft_ms = 0.0
+    metrics.ttft_sample_count = 0
     yield
 
 
@@ -50,6 +55,7 @@ def test_chat_completions_shape(client: TestClient):
     r = client.post("/v1/chat/completions", json=payload)
     assert r.status_code == 200
     assert "X-Latency-Ms" in r.headers
+    assert "X-TTFT-Ms" in r.headers
     data = r.json()
     assert data["object"] == "chat.completion"
     assert data["model"] == "stub-model"
@@ -85,16 +91,67 @@ def test_different_input_different_digest(client: TestClient):
     assert a["choices"][0]["message"]["content"] != b["choices"][0]["message"]["content"]
 
 
-def test_stream_rejected(client: TestClient):
-    r = client.post(
+def test_stream_sse_openai_wire(client: TestClient):
+    """stream=true must emit OpenAI-compatible SSE chunks ending with [DONE]."""
+    with client.stream(
+        "POST",
         "/v1/chat/completions",
         json={
-            "messages": [{"role": "user", "content": "x"}],
+            "messages": [{"role": "user", "content": "stream please"}],
             "stream": True,
         },
+    ) as r:
+        assert r.status_code == 200
+        assert "text/event-stream" in r.headers.get("content-type", "")
+        assert "X-TTFT-Ms" in r.headers
+        assert float(r.headers["X-TTFT-Ms"]) >= 0
+        raw = r.read().decode("utf-8")
+
+    assert "data: [DONE]" in raw
+    events = []
+    for line in raw.splitlines():
+        if not line.startswith("data: "):
+            continue
+        payload = line[len("data: ") :]
+        if payload.strip() == "[DONE]":
+            events.append("[DONE]")
+            continue
+        events.append(json.loads(payload))
+
+    assert events[-1] == "[DONE]"
+    chunks = events[:-1]
+    assert len(chunks) >= 2
+    assert all(c["object"] == "chat.completion.chunk" for c in chunks)
+    assert chunks[0]["choices"][0]["delta"].get("role") == "assistant"
+    assembled = "".join(
+        (c["choices"][0]["delta"].get("content") or "") for c in chunks
     )
-    assert r.status_code == 400
-    assert "stream" in r.json()["detail"].lower()
+    assert "stream please" in assembled
+    assert chunks[-1]["choices"][0]["finish_reason"] in ("stop", "length")
+
+
+def test_stream_matches_non_stream_content(client: TestClient):
+    payload = {"messages": [{"role": "user", "content": "parity check"}]}
+    non = client.post("/v1/chat/completions", json={**payload, "stream": False}).json()
+    expected = non["choices"][0]["message"]["content"]
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={**payload, "stream": True},
+    ) as r:
+        raw = r.read().decode("utf-8")
+
+    parts: list[str] = []
+    for line in raw.splitlines():
+        if not line.startswith("data: "):
+            continue
+        data = line[len("data: ") :]
+        if data.strip() == "[DONE]":
+            break
+        chunk = json.loads(data)
+        parts.append(chunk["choices"][0]["delta"].get("content") or "")
+    assert "".join(parts) == expected
 
 
 def test_validation_requires_messages(client: TestClient):
@@ -107,16 +164,22 @@ def test_metrics_endpoint(client: TestClient):
         "/v1/chat/completions",
         json={"messages": [{"role": "user", "content": "m1"}]},
     )
-    client.post(
+    with client.stream(
+        "POST",
         "/v1/chat/completions",
-        json={"messages": [{"role": "user", "content": "m2"}]},
-    )
+        json={"messages": [{"role": "user", "content": "m2"}], "stream": True},
+    ) as r:
+        r.read()
     r = client.get("/metrics")
     assert r.status_code == 200
     body = r.json()
     assert body["request_count"] == 2
+    assert body["stream_request_count"] == 1
     assert body["error_count"] == 0
     assert body["avg_latency_ms"] >= 0
+    assert body["ttft_sample_count"] == 2
+    assert body["avg_ttft_ms"] >= 0
+    assert "last_ttft_ms" in body
     assert "model" in body
 
 
