@@ -159,7 +159,7 @@ def test_validation_requires_messages(client: TestClient):
     assert r.status_code == 422
 
 
-def test_metrics_endpoint(client: TestClient):
+def test_metrics_json_endpoint(client: TestClient):
     client.post(
         "/v1/chat/completions",
         json={"messages": [{"role": "user", "content": "m1"}]},
@@ -170,7 +170,7 @@ def test_metrics_endpoint(client: TestClient):
         json={"messages": [{"role": "user", "content": "m2"}], "stream": True},
     ) as r:
         r.read()
-    r = client.get("/metrics")
+    r = client.get("/metrics.json")
     assert r.status_code == 200
     body = r.json()
     assert body["request_count"] == 2
@@ -181,6 +181,29 @@ def test_metrics_endpoint(client: TestClient):
     assert body["avg_ttft_ms"] >= 0
     assert "last_ttft_ms" in body
     assert "model" in body
+
+
+def test_metrics_prometheus_text(client: TestClient):
+    client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "prom"}]},
+    )
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    ctype = r.headers.get("content-type", "")
+    assert "text/plain" in ctype
+    assert "version=0.0.4" in ctype
+    body = r.text
+    assert "# HELP stub_requests_total" in body
+    assert "# TYPE stub_requests_total counter" in body
+    assert "stub_requests_total{" in body
+    assert "stub_ttft_ms_avg{" in body
+    assert "stub_stream_requests_total{" in body
+    # At least one sample line with a numeric value
+    assert any(
+        line.startswith("stub_requests_total") and line.rstrip().endswith("1")
+        for line in body.splitlines()
+    )
 
 
 def test_max_tokens_truncation(client: TestClient):

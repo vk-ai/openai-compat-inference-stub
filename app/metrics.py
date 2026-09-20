@@ -1,7 +1,13 @@
-"""In-process latency / request metrics for the stub."""
+"""In-process latency / request metrics for the stub.
+
+Exposes:
+- JSON snapshot (humans / dashboards that prefer JSON)
+- Prometheus text exposition (scrapers) — hand-rolled, no prometheus_client dep
+"""
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -63,6 +69,47 @@ class MetricsStore:
                 "avg_ttft_ms": round(avg_ttft, 3),
                 "last_ttft_ms": round(self.last_ttft_ms, 3),
             }
+
+    def prometheus_text(self, *, model: str | None = None) -> str:
+        """Prometheus exposition format (text/plain; version=0.0.4).
+
+        Hand-rolled teaching formatter — not the official client library.
+        """
+        snap = self.snapshot()
+        model = model or os.getenv("STUB_MODEL_ID", "stub-model")
+        # Escape label values lightly
+        model_label = model.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        lines = [
+            "# HELP stub_requests_total Total chat completion requests handled by the stub.",
+            "# TYPE stub_requests_total counter",
+            f'stub_requests_total{{model="{model_label}"}} {snap["request_count"]}',
+            "# HELP stub_stream_requests_total Streaming (SSE) chat completion requests.",
+            "# TYPE stub_stream_requests_total counter",
+            f'stub_stream_requests_total{{model="{model_label}"}} {snap["stream_request_count"]}',
+            "# HELP stub_errors_total Error responses from the stub.",
+            "# TYPE stub_errors_total counter",
+            f'stub_errors_total{{model="{model_label}"}} {snap["error_count"]}',
+            "# HELP stub_latency_ms_sum Cumulative end-to-end latency in milliseconds.",
+            "# TYPE stub_latency_ms_sum counter",
+            f'stub_latency_ms_sum{{model="{model_label}"}} {snap["total_latency_ms"]}',
+            "# HELP stub_latency_ms_avg Average end-to-end latency in milliseconds.",
+            "# TYPE stub_latency_ms_avg gauge",
+            f'stub_latency_ms_avg{{model="{model_label}"}} {snap["avg_latency_ms"]}',
+            "# HELP stub_latency_ms_last Most recent end-to-end latency in milliseconds.",
+            "# TYPE stub_latency_ms_last gauge",
+            f'stub_latency_ms_last{{model="{model_label}"}} {snap["last_latency_ms"]}',
+            "# HELP stub_ttft_samples_total Number of TTFT samples recorded.",
+            "# TYPE stub_ttft_samples_total counter",
+            f'stub_ttft_samples_total{{model="{model_label}"}} {snap["ttft_sample_count"]}',
+            "# HELP stub_ttft_ms_avg Average time-to-first-token in milliseconds.",
+            "# TYPE stub_ttft_ms_avg gauge",
+            f'stub_ttft_ms_avg{{model="{model_label}"}} {snap["avg_ttft_ms"]}',
+            "# HELP stub_ttft_ms_last Most recent time-to-first-token in milliseconds.",
+            "# TYPE stub_ttft_ms_last gauge",
+            f'stub_ttft_ms_last{{model="{model_label}"}} {snap["last_ttft_ms"]}',
+            "",
+        ]
+        return "\n".join(lines)
 
 
 metrics = MetricsStore()

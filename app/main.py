@@ -30,7 +30,7 @@ app = FastAPI(
     description=(
         "OSS/learning FastAPI stub that implements a minimal OpenAI-compatible "
         "POST /v1/chat/completions surface (JSON + stream=true SSE) with a "
-        "deterministic mock model, latency, and TTFT metrics. "
+        "deterministic mock model, latency, TTFT, and Prometheus /metrics. "
         "Not employer production software."
     ),
     version=__version__,
@@ -125,8 +125,18 @@ def health() -> dict[str, str]:
 
 
 @app.get("/metrics")
-def get_metrics() -> dict[str, Any]:
-    """Simple JSON metrics (request count + latency / TTFT aggregates)."""
+def get_metrics_prometheus() -> Response:
+    """Prometheus text exposition (scrapers). Content-Type: text/plain; version=0.0.4."""
+    body = metrics.prometheus_text(model=os.getenv("STUB_MODEL_ID", DEFAULT_MODEL_ID))
+    return Response(
+        content=body,
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
+
+
+@app.get("/metrics.json")
+def get_metrics_json() -> dict[str, Any]:
+    """JSON metrics (humans / simple dashboards). Same aggregates as /metrics."""
     snap = metrics.snapshot()
     snap["model"] = os.getenv("STUB_MODEL_ID", DEFAULT_MODEL_ID)
     return snap
