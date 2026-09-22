@@ -10,7 +10,8 @@ Minimal **OpenAI-compatible** chat completions serving stub built with **FastAPI
 
 - `POST /v1/chat/completions` — OpenAI-ish request/response shape
 - **Mock model** — deterministic reply derived from `messages` (no GPU, no network)
-- **Latency + TTFT metrics** — `X-Latency-Ms` / `X-TTFT-Ms` headers, `latency_ms` on the JSON body, and `GET /metrics` (`avg_ttft_ms`, `last_ttft_ms`, `stream_request_count`)
+- **Latency + TTFT metrics** — `X-Latency-Ms` / `X-TTFT-Ms` headers, `latency_ms` on the JSON body
+- **Prometheus text** — `GET /metrics` (`text/plain; version=0.0.4`) for scrapers; JSON aggregates at `GET /metrics.json`
 - **Streaming** — `stream=true` returns OpenAI-compatible SSE (`data: {chunk}\n\n` … `data: [DONE]`)
 - `GET /health` — liveness
 
@@ -47,10 +48,17 @@ curl -N -s -X POST http://127.0.0.1:8000/v1/chat/completions \
     "messages": [{"role": "user", "content": "Hello stream"}]
   }'
 
-# Health + metrics (includes TTFT aggregates after stream)
+# Health + metrics (Prometheus text + JSON)
 curl -s http://127.0.0.1:8000/health | python -m json.tool
-curl -s http://127.0.0.1:8000/metrics | python -m json.tool
+curl -s http://127.0.0.1:8000/metrics
+curl -s http://127.0.0.1:8000/metrics.json | python -m json.tool
 ```
+
+> **Honesty:** Hand-rolled Prometheus exposition for learning — not the official
+> `prometheus_client` library, not a production inference gateway, and not employer
+> (or vendor) production parity. JSON `/metrics.json` remains for humans; scrapers
+> speak Prometheus text at `/metrics`.
+
 
 ## Configuration
 
