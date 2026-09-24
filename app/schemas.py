@@ -11,6 +11,8 @@ class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"] = "user"
     content: str | None = ""
     name: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -31,15 +33,27 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Any | None = None
 
 
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str  # JSON string per OpenAI wire format
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: Literal["function"] = "function"
+    function: FunctionCall
+
+
 class ChatCompletionMessage(BaseModel):
     role: Literal["assistant"] = "assistant"
-    content: str
+    content: str | None = None
+    tool_calls: list[ToolCall] | None = None
 
 
 class ChatCompletionChoice(BaseModel):
     index: int = 0
     message: ChatCompletionMessage
-    finish_reason: Literal["stop", "length"] = "stop"
+    finish_reason: Literal["stop", "length", "tool_calls"] = "stop"
 
 
 class Usage(BaseModel):
@@ -59,15 +73,28 @@ class ChatCompletionResponse(BaseModel):
     latency_ms: float
 
 
+class ChatCompletionChunkDeltaToolCallFunction(BaseModel):
+    name: str | None = None
+    arguments: str | None = None
+
+
+class ChatCompletionChunkDeltaToolCall(BaseModel):
+    index: int = 0
+    id: str | None = None
+    type: Literal["function"] | None = None
+    function: ChatCompletionChunkDeltaToolCallFunction | None = None
+
+
 class ChatCompletionChunkDelta(BaseModel):
     role: Literal["assistant"] | None = None
     content: str | None = None
+    tool_calls: list[ChatCompletionChunkDeltaToolCall] | None = None
 
 
 class ChatCompletionChunkChoice(BaseModel):
     index: int = 0
     delta: ChatCompletionChunkDelta
-    finish_reason: Literal["stop", "length"] | None = None
+    finish_reason: Literal["stop", "length", "tool_calls"] | None = None
 
 
 class ChatCompletionChunk(BaseModel):

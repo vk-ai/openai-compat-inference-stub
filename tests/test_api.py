@@ -219,3 +219,110 @@ def test_max_tokens_truncation(client: TestClient):
     words = data["choices"][0]["message"]["content"].split()
     assert len(words) <= 3
     assert data["choices"][0]["finish_reason"] == "length"
+
+
+_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search",
+        "description": "Mock search",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+}
+
+
+def test_tool_calls_non_stream(client: TestClient):
+    payload = {
+        "model": "stub-model",
+        "messages": [{"role": "user", "content": "find Paris"}],
+        "tools": [_SEARCH_TOOL],
+        "tool_choice": "auto",
+    }
+    r = client.post("/v1/chat/completions", json=payload)
+    assert r.status_code == 200
+    data = r.json()
+    choice = data["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    msg = choice["message"]
+    assert msg["content"] is None
+    assert msg["tool_calls"] and len(msg["tool_calls"]) == 1
+    tc = msg["tool_calls"][0]
+    assert tc["type"] == "function"
+    assert tc["id"].startswith("call_")
+    assert tc["function"]["name"] == "search"
+    args = json.loads(tc["function"]["arguments"])
+    assert args["query"] == "find Paris"
+    assert "_stub_digest" in args
+
+
+def test_tool_calls_deterministic(client: TestClient):
+    payload = {
+        "messages": [{"role": "user", "content": "same tools"}],
+        "tools": [_SEARCH_TOOL],
+    }
+    a = client.post("/v1/chat/completions", json=payload).json()
+    b = client.post("/v1/chat/completions", json=payload).json()
+    assert a["choices"][0]["message"]["tool_calls"] == b["choices"][0]["message"]["tool_calls"]
+
+
+def test_tool_choice_none_skips_tools(client: TestClient):
+    payload = {
+        "messages": [{"role": "user", "content": "no tools please"}],
+        "tools": [_SEARCH_TOOL],
+        "tool_choice": "none",
+    }
+    data = client.post("/v1/chat/completions", json=payload).json()
+    choice = data["choices"][0]
+    assert choice["finish_reason"] in ("stop", "length")
+    assert choice["message"].get("tool_calls") in (None, [])
+    assert "no tools please" in (choice["message"]["content"] or "")
+
+
+def test_tool_calls_stream_deltas(client: TestClient):
+    """Streaming must emit stable-index tool_call chunks + finish_reason tool_calls."""
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "stream tools"}],
+            "tools": [_SEARCH_TOOL],
+            "stream": True,
+        },
+    ) as r:
+        assert r.status_code == 200
+        raw = r.read().decode("utf-8")
+
+    assert "data: [DONE]" in raw
+    chunks = []
+    for line in raw.splitlines():
+        if not line.startswith("data: "):
+            continue
+        payload = line[len("data: ") :]
+        if payload.strip() == "[DONE]":
+            break
+        chunks.append(json.loads(payload))
+
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    # First delta carries role + tool call id/name
+    first_delta = chunks[0]["choices"][0]["delta"]
+    assert first_delta.get("role") == "assistant"
+    assert first_delta["tool_calls"][0]["id"].startswith("call_")
+    assert first_delta["tool_calls"][0]["function"]["name"] == "search"
+    assert first_delta["tool_calls"][0]["index"] == 0
+
+    # Argument pieces reassemble to valid JSON
+    arg_parts = []
+    for c in chunks:
+        delta = c["choices"][0]["delta"]
+        for tc in delta.get("tool_calls") or []:
+            assert tc.get("index", 0) == 0
+            fn = tc.get("function") or {}
+            if fn.get("arguments"):
+                arg_parts.append(fn["arguments"])
+    assembled = "".join(arg_parts)
+    parsed = json.loads(assembled)
+    assert parsed["query"] == "stream tools"

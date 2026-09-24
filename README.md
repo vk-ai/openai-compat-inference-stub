@@ -13,6 +13,7 @@ Minimal **OpenAI-compatible** chat completions serving stub built with **FastAPI
 - **Latency + TTFT metrics** — `X-Latency-Ms` / `X-TTFT-Ms` headers, `latency_ms` on the JSON body
 - **Prometheus text** — `GET /metrics` (`text/plain; version=0.0.4`) for scrapers; JSON aggregates at `GET /metrics.json`
 - **Streaming** — `stream=true` returns OpenAI-compatible SSE (`data: {chunk}\n\n` … `data: [DONE]`)
+- **Tool calls** — request `tools` / `tool_choice` → deterministic mock `tool_calls` with `finish_reason: tool_calls` (JSON + streamed argument deltas)
 - `GET /health` — liveness
 
 > **Honesty:** This is an OSS/learning stub only. It is not a production inference gateway and does not claim employer (or any vendor) production parity.
@@ -59,6 +60,42 @@ curl -s http://127.0.0.1:8000/metrics.json | python -m json.tool
 > (or vendor) production parity. JSON `/metrics.json` remains for humans; scrapers
 > speak Prometheus text at `/metrics`.
 
+
+
+
+## Tool calls (`tools` / `tool_choice`)
+
+When the request includes OpenAI-style `tools`, the stub returns a deterministic
+mock `tool_calls` message (`finish_reason: tool_calls`) instead of text. With
+`stream=true`, SSE deltas use a stable `tool_calls[].index`, send `id` +
+`function.name` on the first delta, then incremental `function.arguments`
+pieces — the wire shape agent clients (LangChain / GPTMock-style) break on when
+mocked incorrectly.
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "stub-model",
+    "messages": [{"role": "user", "content": "find Paris"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "search",
+        "parameters": {
+          "type": "object",
+          "properties": {"query": {"type": "string"}},
+          "required": ["query"]
+        }
+      }
+    }]
+  }' | python -m json.tool
+```
+
+`tool_choice: "none"` forces a normal text completion even when `tools` is set.
+
+> **Honesty:** Deterministic mock tool planner for offline agent/gateway CI —
+> not a real model, not full OpenAI feature parity, not employer inference.
 
 ## Configuration
 
