@@ -19,6 +19,8 @@ from app.schemas import (
     ChatCompletionChunk,
     ChatCompletionChunkChoice,
     ChatCompletionChunkDelta,
+    ChatCompletionChunkDeltaToolCall,
+    ChatCompletionChunkDeltaToolCallFunction,
     ChatCompletionMessage,
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -30,8 +32,8 @@ app = FastAPI(
     description=(
         "OSS/learning FastAPI stub that implements a minimal OpenAI-compatible "
         "POST /v1/chat/completions surface (JSON + stream=true SSE) with a "
-        "deterministic mock model, latency, TTFT, and Prometheus /metrics. "
-        "Not employer production software."
+        "deterministic mock model, optional tools/tool_calls, latency, TTFT, "
+        "and Prometheus /metrics. Not employer production software."
     ),
     version=__version__,
 )
@@ -63,6 +65,12 @@ def _chunk_content(content: str) -> list[str]:
     return [content[i : i + size] for i in range(0, len(content), size)]
 
 
+def _chunk_tool_arguments(arguments: str, size: int = 16) -> list[str]:
+    if not arguments:
+        return [""]
+    return [arguments[i : i + size] for i in range(0, len(arguments), size)]
+
+
 def _iter_sse(
     *,
     result: MockResult,
@@ -70,7 +78,78 @@ def _iter_sse(
     completion_id: str,
     created: int,
 ) -> Iterator[bytes]:
-    pieces = _chunk_content(result.content)
+    if result.tool_calls:
+        # Streaming tool_calls: role+id+name first, then argument deltas, then finish.
+        # Matches the wire shape LangChain / GPTMock clients break on when wrong.
+        for tc_index, tc in enumerate(result.tool_calls):
+            first = ChatCompletionChunk(
+                id=completion_id,
+                created=created,
+                model=model_id,
+                choices=[
+                    ChatCompletionChunkChoice(
+                        index=0,
+                        delta=ChatCompletionChunkDelta(
+                            role="assistant" if tc_index == 0 else None,
+                            tool_calls=[
+                                ChatCompletionChunkDeltaToolCall(
+                                    index=tc_index,
+                                    id=tc.id,
+                                    type="function",
+                                    function=ChatCompletionChunkDeltaToolCallFunction(
+                                        name=tc.function.name,
+                                        arguments="",
+                                    ),
+                                )
+                            ],
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+            )
+            yield f"data: {first.model_dump_json()}\n\n".encode("utf-8")
+
+            for piece in _chunk_tool_arguments(tc.function.arguments):
+                chunk = ChatCompletionChunk(
+                    id=completion_id,
+                    created=created,
+                    model=model_id,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            index=0,
+                            delta=ChatCompletionChunkDelta(
+                                tool_calls=[
+                                    ChatCompletionChunkDeltaToolCall(
+                                        index=tc_index,
+                                        function=ChatCompletionChunkDeltaToolCallFunction(
+                                            arguments=piece,
+                                        ),
+                                    )
+                                ],
+                            ),
+                            finish_reason=None,
+                        )
+                    ],
+                )
+                yield f"data: {chunk.model_dump_json()}\n\n".encode("utf-8")
+
+        final = ChatCompletionChunk(
+            id=completion_id,
+            created=created,
+            model=model_id,
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChatCompletionChunkDelta(),
+                    finish_reason="tool_calls",
+                )
+            ],
+        )
+        yield f"data: {final.model_dump_json()}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
+        return
+
+    pieces = _chunk_content(result.content or "")
     first = pieces[0] if pieces else ""
     rest = pieces[1:] if len(pieces) > 1 else []
 
@@ -151,7 +230,13 @@ def chat_completions(body: ChatCompletionRequest, response: Response):
 
     try:
         _artificial_delay()
-        result = generate(body.messages, model=model_id, max_tokens=body.max_tokens)
+        result = generate(
+            body.messages,
+            model=model_id,
+            max_tokens=body.max_tokens,
+            tools=body.tools,
+            tool_choice=body.tool_choice,
+        )
 
         if body.stream:
             # TTFT = time until first SSE byte is ready (after mock "prefill")
@@ -191,6 +276,10 @@ def chat_completions(body: ChatCompletionRequest, response: Response):
         response.headers["X-TTFT-Ms"] = str(latency_ms)
         response.headers["X-Stub-Model"] = model_id
 
+        message = ChatCompletionMessage(
+            content=result.content,
+            tool_calls=list(result.tool_calls) if result.tool_calls else None,
+        )
         return ChatCompletionResponse(
             id=completion_id,
             created=created,
@@ -198,7 +287,7 @@ def chat_completions(body: ChatCompletionRequest, response: Response):
             choices=[
                 ChatCompletionChoice(
                     index=0,
-                    message=ChatCompletionMessage(content=result.content),
+                    message=message,
                     finish_reason=result.finish_reason,  # type: ignore[arg-type]
                 )
             ],
