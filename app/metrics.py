@@ -70,7 +70,9 @@ class MetricsStore:
                 "last_ttft_ms": round(self.last_ttft_ms, 3),
             }
 
-    def prometheus_text(self, *, model: str | None = None) -> str:
+    def prometheus_text(
+        self, *, model: str | None = None, faults_injected: dict[str, int] | None = None
+    ) -> str:
         """Prometheus exposition format (text/plain; version=0.0.4).
 
         Hand-rolled teaching formatter — not the official client library.
@@ -107,8 +109,15 @@ class MetricsStore:
             "# HELP stub_ttft_ms_last Most recent time-to-first-token in milliseconds.",
             "# TYPE stub_ttft_ms_last gauge",
             f'stub_ttft_ms_last{{model="{model_label}"}} {snap["last_ttft_ms"]}',
-            "",
+            "# HELP stub_faults_injected_total Faults injected by the stub (429/503/timeout/drop).",
+            "# TYPE stub_faults_injected_total counter",
         ]
+        injected = faults_injected or {}
+        for kind in ("429", "503", "timeout", "drop"):
+            lines.append(
+                f'stub_faults_injected_total{{model="{model_label}",kind="{kind}"}} {injected.get(kind, 0)}'
+            )
+        lines.append("")
         return "\n".join(lines)
 
 

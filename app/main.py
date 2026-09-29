@@ -8,10 +8,19 @@ import uuid
 from collections.abc import Iterator
 from typing import Any
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app import __version__
+from app.faults import (
+    Fault,
+    FaultSpecError,
+    error_body,
+    faults,
+    fmt_retry_after,
+    rate_limits,
+    split_model_fault,
+)
 from app.metrics import Timer, metrics
 from app.mock_model import DEFAULT_MODEL_ID, MockResult, generate
 from app.schemas import (
@@ -33,7 +42,8 @@ app = FastAPI(
         "OSS/learning FastAPI stub that implements a minimal OpenAI-compatible "
         "POST /v1/chat/completions surface (JSON + stream=true SSE) with a "
         "deterministic mock model, optional tools/tool_calls, latency, TTFT, "
-        "and Prometheus /metrics. Not employer production software."
+        "Prometheus /metrics, and opt-in deterministic fault injection "
+        "(429/503/timeout/mid-stream drop). Not employer production software."
     ),
     version=__version__,
 )
@@ -198,6 +208,18 @@ def _iter_sse(
     yield b"data: [DONE]\n\n"
 
 
+def _drop_mid_stream(frames: Iterator[bytes], keep: int) -> Iterator[bytes]:
+    """Fault ``drop:k``: emit the first ``k`` delta frames, then stop.
+
+    The finish chunk (``finish_reason``) and ``data: [DONE]`` are never sent, which is
+    what a client sees when an upstream connection dies mid-generation.
+    """
+    all_frames = list(frames)
+    # Last two frames are always the finish chunk + [DONE]; never send them.
+    body = all_frames[:-2]
+    yield from body[: max(0, keep)]
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "version": __version__}
@@ -206,7 +228,10 @@ def health() -> dict[str, str]:
 @app.get("/metrics")
 def get_metrics_prometheus() -> Response:
     """Prometheus text exposition (scrapers). Content-Type: text/plain; version=0.0.4."""
-    body = metrics.prometheus_text(model=os.getenv("STUB_MODEL_ID", DEFAULT_MODEL_ID))
+    body = metrics.prometheus_text(
+        model=os.getenv("STUB_MODEL_ID", DEFAULT_MODEL_ID),
+        faults_injected=faults.snapshot(),
+    )
     return Response(
         content=body,
         media_type="text/plain; version=0.0.4; charset=utf-8",
@@ -218,18 +243,69 @@ def get_metrics_json() -> dict[str, Any]:
     """JSON metrics (humans / simple dashboards). Same aggregates as /metrics."""
     snap = metrics.snapshot()
     snap["model"] = os.getenv("STUB_MODEL_ID", DEFAULT_MODEL_ID)
+    snap["faults_injected"] = faults.snapshot()
     return snap
 
 
+def _fault_error_response(fault: Fault, *, model_id: str, prompt_tokens: int, timer: Timer) -> JSONResponse:
+    status, payload = error_body(fault)
+    latency_ms = round(timer.elapsed_ms(), 3)
+    metrics.record(latency_ms, error=True)
+    headers = {
+        "X-Latency-Ms": str(latency_ms),
+        "X-Stub-Model": model_id,
+        "X-Stub-Fault": fault.kind,
+        **rate_limits.headers(
+            tokens=prompt_tokens,
+            exhausted=fault.kind == "429",
+            retry_after_s=fault.retry_after_s,
+        ),
+    }
+    if fault.retry_after_s is not None:
+        headers["Retry-After"] = fmt_retry_after(fault.retry_after_s)
+    return JSONResponse(status_code=status, content=payload, headers=headers)
+
+
 @app.post("/v1/chat/completions")
-def chat_completions(body: ChatCompletionRequest, response: Response):
+def chat_completions(body: ChatCompletionRequest, request: Request, response: Response):
     timer = Timer()
-    model_id = body.model or os.getenv("STUB_MODEL_ID", DEFAULT_MODEL_ID)
+    raw_model = body.model or os.getenv("STUB_MODEL_ID", DEFAULT_MODEL_ID)
+    model_id, model_fault_spec = split_model_fault(raw_model)
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
     try:
+        fault = faults.resolve(
+            header=request.headers.get("x-stub-fault"),
+            model_spec=model_fault_spec,
+        )
+    except FaultSpecError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": str(exc),
+                    "type": "invalid_request_error",
+                    "param": "X-Stub-Fault",
+                    "code": "invalid_fault_spec",
+                }
+            },
+        )
+    # drop only applies to streams; for non-stream requests it is a no-op.
+    if fault is not None and fault.kind == "drop" and not body.stream:
+        fault = None
+    if fault is not None:
+        faults.record(fault.kind)
+    prompt_estimate = sum(len((m.content or "").split()) for m in body.messages)
+
+    if fault is not None and fault.kind in ("429", "503"):
+        return _fault_error_response(fault, model_id=model_id, prompt_tokens=prompt_estimate, timer=timer)
+
+    try:
         _artificial_delay()
+        if fault is not None and fault.kind == "timeout":
+            # Hold the request so client-side timeouts fire; then answer normally.
+            time.sleep((fault.timeout_ms or 0) / 1000.0)
         result = generate(
             body.messages,
             model=model_id,
@@ -244,12 +320,15 @@ def chat_completions(body: ChatCompletionRequest, response: Response):
 
             def stream_and_record() -> Iterator[bytes]:
                 try:
-                    yield from _iter_sse(
+                    frames = _iter_sse(
                         result=result,
                         model_id=model_id,
                         completion_id=completion_id,
                         created=created,
                     )
+                    if fault is not None and fault.kind == "drop":
+                        frames = _drop_mid_stream(frames, fault.drop_after or 0)
+                    yield from frames
                 finally:
                     latency_ms = round(timer.elapsed_ms(), 3)
                     metrics.record(
@@ -265,6 +344,8 @@ def chat_completions(body: ChatCompletionRequest, response: Response):
                     "X-Stub-Model": model_id,
                     "X-TTFT-Ms": str(ttft_ms),
                     "X-Latency-Ms": str(ttft_ms),  # end-to-end filled after stream; TTFT is primary
+                    **({"X-Stub-Fault": fault.kind} if fault is not None else {}),
+                    **rate_limits.headers(tokens=result.prompt_tokens + result.completion_tokens),
                 },
             )
 
@@ -275,6 +356,12 @@ def chat_completions(body: ChatCompletionRequest, response: Response):
         response.headers["X-Latency-Ms"] = str(latency_ms)
         response.headers["X-TTFT-Ms"] = str(latency_ms)
         response.headers["X-Stub-Model"] = model_id
+        if fault is not None:
+            response.headers["X-Stub-Fault"] = fault.kind
+        for k, v in rate_limits.headers(
+            tokens=result.prompt_tokens + result.completion_tokens
+        ).items():
+            response.headers[k] = v
 
         message = ChatCompletionMessage(
             content=result.content,
