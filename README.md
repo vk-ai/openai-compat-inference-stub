@@ -14,8 +14,8 @@ Minimal **OpenAI-compatible** chat completions serving stub built with **FastAPI
 - **Prometheus text** — `GET /metrics` (`text/plain; version=0.0.4`) for scrapers; JSON aggregates at `GET /metrics.json`
 - **Streaming** — `stream=true` returns OpenAI-compatible SSE (`data: {chunk}\n\n` … `data: [DONE]`)
 - **Tool calls** — request `tools` / `tool_choice` → deterministic mock `tool_calls` with `finish_reason: tool_calls` (JSON + streamed argument deltas)
-- **Fault injection (opt-in)**: deterministic 429 + `Retry-After`, 503, timeout, and mid-stream drop, plus synthetic `x-ratelimit-*` headers
-- `GET /health`: liveness
+- **Fault injection (opt-in)** — deterministic 429 + `Retry-After`, 503, timeout, and mid-stream drop, plus synthetic `x-ratelimit-*` headers
+- `GET /health` — liveness
 
 > **Honesty:** This is an OSS/learning stub only. It is not a production inference gateway and does not claim employer (or any vendor) production parity.
 
