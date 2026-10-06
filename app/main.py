@@ -23,6 +23,17 @@ from app.faults import (
 )
 from app.metrics import Timer, metrics
 from app.mock_model import DEFAULT_MODEL_ID, MockResult, generate
+from app.responses_api import (
+    ResponsesInputError,
+    ResponsesRequest,
+    build_response,
+    error_payload,
+    iter_events,
+    response_ids,
+    to_chat_messages,
+    to_chat_tool_choice,
+    to_chat_tools,
+)
 from app.schemas import (
     ChatCompletionChoice,
     ChatCompletionChunk,
@@ -40,7 +51,8 @@ app = FastAPI(
     title="OpenAI-Compatible Inference Stub",
     description=(
         "OSS/learning FastAPI stub that implements a minimal OpenAI-compatible "
-        "POST /v1/chat/completions surface (JSON + stream=true SSE) with a "
+        "POST /v1/chat/completions surface (JSON + stream=true SSE), a minimal "
+        "stateless POST /v1/responses (Responses API shape), with a "
         "deterministic mock model, optional tools/tool_calls, latency, TTFT, "
         "Prometheus /metrics, and opt-in deterministic fault injection "
         "(429/503/timeout/mid-stream drop). Not employer production software."
@@ -393,3 +405,118 @@ def chat_completions(body: ChatCompletionRequest, request: Request, response: Re
             content={"error": {"message": str(exc), "type": "stub_error"}},
             headers={"X-Latency-Ms": str(latency_ms)},
         )
+
+
+@app.post("/v1/responses")
+def responses(body: ResponsesRequest, request: Request, response: Response):
+    """Minimal stateless Responses API (see ``app/responses_api.py``)."""
+    timer = Timer()
+    raw_model = body.model or os.getenv("STUB_MODEL_ID", DEFAULT_MODEL_ID)
+    model_id, model_fault_spec = split_model_fault(raw_model)
+    created_at = int(time.time())
+
+    if body.previous_response_id is not None:
+        return JSONResponse(
+            status_code=400,
+            content=error_payload(
+                "This stub is stateless and stores no responses; resend the full "
+                "conversation in `input` instead of using previous_response_id.",
+                param="previous_response_id",
+                code="previous_response_not_supported",
+            ),
+        )
+    try:
+        messages = to_chat_messages(body)
+    except ResponsesInputError as exc:
+        return JSONResponse(
+            status_code=400, content=error_payload(str(exc), param=exc.param, code=exc.code)
+        )
+    chat_tools, ignored_tools = to_chat_tools(body.tools)
+    tool_choice = to_chat_tool_choice(body.tool_choice, body.input)
+
+    try:
+        fault = faults.resolve(
+            header=request.headers.get("x-stub-fault"),
+            model_spec=model_fault_spec,
+        )
+    except FaultSpecError as exc:
+        return JSONResponse(
+            status_code=400,
+            content=error_payload(str(exc), param="X-Stub-Fault", code="invalid_fault_spec"),
+        )
+    if fault is not None and fault.kind == "drop" and not body.stream:
+        fault = None
+    if fault is not None:
+        faults.record(fault.kind)
+    prompt_estimate = sum(len((m.content or "").split()) for m in messages)
+    if fault is not None and fault.kind in ("429", "503"):
+        return _fault_error_response(fault, model_id=model_id, prompt_tokens=prompt_estimate, timer=timer)
+
+    _artificial_delay()
+    if fault is not None and fault.kind == "timeout":
+        time.sleep((fault.timeout_ms or 0) / 1000.0)
+    result = generate(
+        messages,
+        model=model_id,
+        max_tokens=body.max_output_tokens or 256,
+        tools=chat_tools,
+        tool_choice=tool_choice,
+    )
+    resp_id, suffix = response_ids(body, model_id)
+    extra_headers = {"X-Stub-Model": model_id}
+    if fault is not None:
+        extra_headers["X-Stub-Fault"] = fault.kind
+    if ignored_tools:
+        extra_headers["X-Stub-Ignored-Tools"] = ",".join(ignored_tools)
+
+    if body.stream:
+        ttft_ms = round(timer.elapsed_ms(), 3)
+
+        def stream_and_record() -> Iterator[bytes]:
+            try:
+                yield from iter_events(
+                    body,
+                    result=result,
+                    model_id=model_id,
+                    resp_id=resp_id,
+                    suffix=suffix,
+                    created_at=created_at,
+                    drop_after=(fault.drop_after or 0)
+                    if fault is not None and fault.kind == "drop"
+                    else None,
+                )
+            finally:
+                metrics.record(
+                    round(timer.elapsed_ms(), 3), error=False, stream=True, ttft_ms=ttft_ms
+                )
+
+        return StreamingResponse(
+            stream_and_record(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "X-TTFT-Ms": str(ttft_ms),
+                "X-Latency-Ms": str(ttft_ms),
+                **extra_headers,
+                **rate_limits.headers(tokens=result.prompt_tokens + result.completion_tokens),
+            },
+        )
+
+    latency_ms = round(timer.elapsed_ms(), 3)
+    metrics.record(latency_ms, error=False, stream=False, ttft_ms=latency_ms)
+    response.headers["X-Latency-Ms"] = str(latency_ms)
+    response.headers["X-TTFT-Ms"] = str(latency_ms)
+    for k, v in {
+        **extra_headers,
+        **rate_limits.headers(tokens=result.prompt_tokens + result.completion_tokens),
+    }.items():
+        response.headers[k] = v
+    return build_response(
+        body,
+        result=result,
+        model_id=model_id,
+        resp_id=resp_id,
+        suffix=suffix,
+        created_at=created_at,
+    )
