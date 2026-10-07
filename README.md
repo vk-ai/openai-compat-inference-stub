@@ -15,6 +15,7 @@ Minimal **OpenAI-compatible** chat completions serving stub built with **FastAPI
 - **Streaming** — `stream=true` returns OpenAI-compatible SSE (`data: {chunk}\n\n` … `data: [DONE]`)
 - **Tool calls** — request `tools` / `tool_choice` → deterministic mock `tool_calls` with `finish_reason: tool_calls` (JSON + streamed argument deltas)
 - **Fault injection (opt-in)** — deterministic 429 + `Retry-After`, 503, timeout, and mid-stream drop, plus synthetic `x-ratelimit-*` headers
+- **Responses API (minimal, stateless)** — `POST /v1/responses` with JSON or typed SSE events (`response.created` … `response.completed`)
 - `GET /health` — liveness
 
 > **Honesty:** This is an OSS/learning stub only. It is not a production inference gateway and does not claim employer (or any vendor) production parity.
@@ -98,6 +99,48 @@ curl -s -X POST http://127.0.0.1:8000/v1/chat/completions \
 > **Honesty:** Deterministic mock tool planner for offline agent/gateway CI —
 > not a real model, not full OpenAI feature parity, not employer inference.
 
+## Responses API (`POST /v1/responses`, minimal + stateless)
+
+Newer clients (Codex CLI, recent SDKs, agent frameworks) speak the Responses API
+rather than Chat Completions. The open requests to support it are some of the most
+upvoted issues on local inference servers:
+[llama.cpp#19138](https://github.com/ggml-org/llama.cpp/issues/19138),
+[ollama#10309](https://github.com/ollama/ollama/issues/10309),
+[ollama#9659](https://github.com/ollama/ollama/issues/9659),
+[vllm#14721](https://github.com/vllm-project/vllm/issues/14721), and the
+[vllm#57499 "stateless Responses API" RFC](https://github.com/vllm-project/vllm/issues/57499).
+This stub adds a small, deterministic subset you can point such clients at in CI.
+
+```bash
+curl -s localhost:8000/v1/responses -H 'Content-Type: application/json' \
+  -d '{"model":"stub-model","instructions":"be brief","input":"Hello"}'
+
+# typed SSE events (no data: [DONE] in this API)
+curl -sN localhost:8000/v1/responses -H 'Content-Type: application/json' \
+  -d '{"input":"Hello","stream":true}'
+```
+
+| Supported | Notes |
+|---|---|
+| `input` as a string or list of items | message items (`content` string or `input_text`/`output_text` parts; `developer` treated as `system`), `function_call`, `function_call_output`; `reasoning` items are ignored |
+| `instructions` | becomes the system prompt |
+| `tools` with `type: function` | flat Responses tool shape; other tool types are ignored and listed in `X-Stub-Ignored-Tools` |
+| `tool_choice` | `auto` / `none` / `required` / `{"type":"function","name":...}` |
+| `max_output_tokens` | truncation gives `status: "incomplete"`, `incomplete_details.reason: "max_output_tokens"` |
+| `stream: true` | `response.created` → `response.in_progress` → `response.output_item.added` → `response.content_part.added` → `response.output_text.delta`… → `response.output_text.done` → `response.content_part.done` → `response.output_item.done` → `response.completed` (or `response.incomplete`); function calls stream `response.function_call_arguments.delta` / `.done`. Each event carries `sequence_number`. |
+| Faults | `X-Stub-Fault` / `model::fault=` apply as on chat (`429`, `503`, `timeout`, `drop:k` = stop after k delta events with no terminal event) |
+
+**Stateless by design:** nothing is stored, every response reports `store: false`,
+and `previous_response_id` returns a 400 (`code: previous_response_not_supported`).
+Resend the whole conversation in `input`, including the `function_call` and `function_call_output`
+items. IDs (`resp_…`, `msg_…`, `fc_…`) are a hash of the request, so the same
+request gives the same ids and output. After a `function_call_output` as the last
+input item, the stub answers in text (unless `tool_choice` forces a tool), so agent loops terminate.
+
+> **Honesty:** A learning-sized subset of the Responses API (no built-in tools,
+> no storage, no reasoning items, no structured `text.format`). It is not OpenAI parity.
+> For a fuller mock, see [axium-lab/llm-mock](https://github.com/axium-lab/llm-mock).
+
 ## Fault injection (429 / 503 / timeout / mid-stream drop)
 
 Retry, backoff, and fallback code is only trustworthy if you can make the upstream fail **on purpose, the same way every time**. The stub can inject OpenAI-shaped failures deterministically. They are **off by default**.
@@ -165,6 +208,7 @@ with the `workflow` scope to push that path).
 ```
 app/
   main.py        # FastAPI routes
+  responses_api.py # Minimal stateless /v1/responses mapping + typed SSE events
   schemas.py     # OpenAI-ish pydantic models
   mock_model.py  # Deterministic mock generator
   metrics.py     # In-process latency counters
