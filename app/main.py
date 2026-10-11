@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 import uuid
@@ -220,6 +221,42 @@ def _iter_sse(
     yield b"data: [DONE]\n\n"
 
 
+def _with_usage(
+    frames: Iterator[bytes],
+    *,
+    usage: dict[str, int],
+    model_id: str,
+    completion_id: str,
+    created: int,
+) -> Iterator[bytes]:
+    """OpenAI stream_options.include_usage wire shape.
+
+    Every content chunk carries ``"usage": null``; one extra chunk with
+    ``choices: []`` and the real usage object is sent right before ``[DONE]``.
+    If the stream is dropped mid-way (fault injection) no usage chunk is sent,
+    which matches what a client sees when the upstream dies.
+    """
+    for frame in frames:
+        if frame == b"data: [DONE]\n\n":
+            final = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_id,
+                "choices": [],
+                "usage": usage,
+            }
+            yield f"data: {json.dumps(final, separators=(',', ':'))}\n\n".encode("utf-8")
+            yield frame
+            continue
+        if frame.startswith(b"data: "):
+            obj = json.loads(frame[len(b"data: "):])
+            obj["usage"] = None
+            yield f"data: {json.dumps(obj, separators=(',', ':'))}\n\n".encode("utf-8")
+        else:
+            yield frame
+
+
 def _drop_mid_stream(frames: Iterator[bytes], keep: int) -> Iterator[bytes]:
     """Fault ``drop:k``: emit the first ``k`` delta frames, then stop.
 
@@ -338,6 +375,18 @@ def chat_completions(body: ChatCompletionRequest, request: Request, response: Re
                         completion_id=completion_id,
                         created=created,
                     )
+                    if body.stream_options is not None and body.stream_options.include_usage:
+                        frames = _with_usage(
+                            frames,
+                            usage={
+                                "prompt_tokens": result.prompt_tokens,
+                                "completion_tokens": result.completion_tokens,
+                                "total_tokens": result.prompt_tokens + result.completion_tokens,
+                            },
+                            model_id=model_id,
+                            completion_id=completion_id,
+                            created=created,
+                        )
                     if fault is not None and fault.kind == "drop":
                         frames = _drop_mid_stream(frames, fault.drop_after or 0)
                     yield from frames

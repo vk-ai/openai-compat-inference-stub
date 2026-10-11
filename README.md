@@ -65,6 +65,23 @@ curl -s http://127.0.0.1:8000/metrics.json | python -m json.tool
 
 
 
+## Streaming usage (`stream_options.include_usage`)
+
+Send `"stream_options": {"include_usage": true}` with `stream: true` and the stub
+follows the OpenAI wire shape: every normal chunk carries `"usage": null`, and one
+extra chunk with `"choices": []` and the real `usage` object arrives just before
+`data: [DONE]`. Tool-call streams get it too. A stream cut short by the `drop`
+fault sends no usage chunk, which is what clients see when an upstream dies.
+People ask for this on many servers and gateways
+([vllm#7299](https://github.com/vllm-project/vllm/issues/7299),
+[llama.cpp#15443](https://github.com/ggml-org/llama.cpp/issues/15443),
+[openclaw#90495](https://github.com/openclaw/openclaw/issues/90495)).
+
+**Real vs stubbed:** the chunk shape and the "usage = non-stream usage" rule are
+real and tested. The token counts come from the stub's whitespace-style mock
+counter, not a real tokenizer. The contract lives in
+`tests/fixtures/include_usage_stream.json`, which vk-ai/llm-platform-k8s also uses.
+
 ## Tool calls (`tools` / `tool_choice`)
 
 When the request includes OpenAI-style `tools`, the stub returns a deterministic
