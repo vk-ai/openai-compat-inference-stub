@@ -80,3 +80,18 @@ def test_mid_stream_drop_sends_no_usage(client):
     ev = _stream(client, FIXTURE["request"], headers={"X-Stub-Fault": "drop:2"})
     assert "[DONE]" not in ev
     assert all(c.get("choices") != [] for c in ev)
+
+
+def test_recorded_transcript_is_reproducible(client):
+    """include_usage_stream.sse is a recorded transcript (id/created normalised).
+
+    llm-platform-k8s replays this exact file through its gateway, so if the
+    stub's wire format changes this test flags that the shared copy is stale.
+    """
+    import re
+
+    with client.stream("POST", "/v1/chat/completions", json=FIXTURE["request"]) as r:
+        raw = r.read().decode()
+    raw = re.sub(r'"id":"[^"]+"', '"id":"chatcmpl-fixture"', raw)
+    raw = re.sub(r'"created":\d+', '"created":0', raw)
+    assert raw == (Path(__file__).parent / "fixtures" / "include_usage_stream.sse").read_text()
