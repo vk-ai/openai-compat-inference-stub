@@ -15,12 +15,18 @@ class ChatMessage(BaseModel):
     tool_call_id: str | None = None
 
 
+class StreamOptions(BaseModel):
+    include_usage: bool = False
+
+
 class ChatCompletionRequest(BaseModel):
     model: str = Field(default="stub-model")
     messages: list[ChatMessage] = Field(..., min_length=1)
     temperature: float | None = Field(default=0.0, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=256, ge=1)
     stream: bool = False
+    # OpenAI: {"include_usage": true} adds a final chunk with choices=[] and usage.
+    stream_options: StreamOptions | None = None
     n: int | None = Field(default=1, ge=1, le=1)
     stop: str | list[str] | None = None
     user: str | None = None
